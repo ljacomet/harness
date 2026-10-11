@@ -1783,7 +1783,8 @@ function registerIpcHandlers(): void {
     repoRoot: string,
     path: string,
     force?: boolean,
-    removeMeta?: { prNumber?: number; prState?: PRState }
+    removeMeta?: { prNumber?: number; prState?: PRState },
+    opts?: { overrideLock?: boolean }
   ) => {
     if (!repoRoot) throw new Error('No repo root provided')
     // Drop any locally-merged flag for the branch at this path. We still
@@ -1814,7 +1815,10 @@ function registerIpcHandlers(): void {
       repoRoot,
       path,
       branch: wt?.branch || '',
-      force
+      force,
+      locked: wt?.locked,
+      lockedReason: wt?.lockedReason,
+      overrideLock: opts?.overrideLock
     })
     return { queued: true }
   })
