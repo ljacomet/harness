@@ -101,6 +101,11 @@ export interface JsonClaudeManagerOptions {
   getUseSystemClaude: () => boolean
   getApprovalSocketPath: (sessionId: string) => string
   closeApprovalSession: (sessionId: string) => void
+  /** Called for every tool_result we see so an approval still pending
+   *  for that tool_use id can be dropped — Claude Code aborting its
+   *  `approve` MCP call (idle timeout) is otherwise invisible to us.
+   *  See ApprovalBridge.cancelPendingForToolUse. */
+  cancelApprovalForToolUse: (sessionId: string, toolUseId: string) => void
   getClaudeEnvVars: () => Record<string, string>
   /** Looked up from main when building the inline MCP config. Returning
    *  null means the ness-control bridge isn't injected (settings flag
@@ -594,6 +599,14 @@ export class JsonClaudeManager {
     // need a separate Node install in packaged builds.
     //   * ness-permissions: receives the per-tool approval requests
     //     Claude raises via --permission-prompt-tool. Tool is 'approve'.
+    //     Deliberately carries no per-server `timeout`, so Claude's
+    //     default MCP idle timeout (1800s) still aborts an approval
+    //     nobody answered. That's wanted: the agent gets an error
+    //     tool_result and can work around the question or move to
+    //     something else instead of parking forever. Ness reconciles
+    //     the abort via cancelApprovalForToolUse — setting a timeout
+    //     here to "fix" a vanishing approval card would trade a
+    //     self-healing agent for a blocked one.
     //   * ness-control: the same MCP bridge used by xterm-backed
     //     Claude tabs, exposing ness-control tools (worktree mgmt,
     //     browser tabs, shell tabs, etc.). Skipped when settings has
@@ -1711,6 +1724,10 @@ export class JsonClaudeManager {
     if (type === 'user') {
       const results = extractToolResults(parsed)
       for (const r of results) {
+        // A result means this tool call is decided, so an approval still
+        // pending for it can never be answered — drop it before the
+        // card and its needs-approval dot outlive the turn.
+        this.opts.cancelApprovalForToolUse(instance.sessionId, r.toolUseId)
         this.store.dispatch({
           type: 'jsonClaude/toolResultAttached',
           payload: {

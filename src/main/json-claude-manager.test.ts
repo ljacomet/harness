@@ -81,13 +81,15 @@ describe('JsonClaudeManager', () => {
   function makeManager(
     store: Store,
     launchSettings: ClaudeLaunchSettings = { tuiFullscreen: true },
-    useSystemClaude = false
+    useSystemClaude = false,
+    cancelApprovalForToolUse: (sessionId: string, toolUseId: string) => void = vi.fn()
   ): JsonClaudeManager {
     return new JsonClaudeManager(store, {
       getClaudeCommand: () => 'claude',
       getUseSystemClaude: () => useSystemClaude,
       getApprovalSocketPath: (sid) => `/tmp/sock-${sid}`,
       closeApprovalSession: vi.fn(),
+      cancelApprovalForToolUse,
       getClaudeEnvVars: () => ({}),
       getControlServer: () => null,
       getControlBridgeScriptPath: () => '/tmp/bridge.js',
@@ -291,6 +293,67 @@ describe('JsonClaudeManager', () => {
     expect(call.args).toContain('opus')
     expect(call.args).toContain('--name')
     expect(call.args).toContain('r/b')
+  })
+
+  // Load-bearing absence: with no per-server `timeout`, Claude's default
+  // MCP idle timeout (1800s) aborts an approval nobody answered, and the
+  // agent works around the question instead of parking forever. Setting
+  // one here to keep an approval card alive longer would trade a
+  // self-healing agent for a blocked one — Ness reconciles the abort
+  // instead (see the stale-approval test below).
+  it('sets no timeout on the ness-permissions MCP server', () => {
+    const store = new Store()
+    const mgr = makeManager(store)
+    store.dispatch({
+      type: 'jsonClaude/sessionStarted',
+      payload: { sessionId: 'sess-mcp-timeout', worktreePath: '/tmp/wt' }
+    })
+    mgr.create('sess-mcp-timeout', '/tmp/wt')
+    const call = spawnCalls
+      .filter((c) => c.args.some((a) => a.includes('--permission-prompt-tool')))
+      .pop()
+    const configIdx = call!.args.indexOf('--mcp-config')
+    const config = JSON.parse(call!.args[configIdx + 1]) as {
+      mcpServers: Record<string, { timeout?: number }>
+    }
+    expect(config.mcpServers['ness-permissions']).toBeDefined()
+    expect(config.mcpServers['ness-permissions'].timeout).toBeUndefined()
+  })
+
+  it('drops a stale approval when a tool_result lands for its tool_use', () => {
+    // Claude Code aborting its `approve` MCP call is reported as an
+    // is_error tool_result on the original tool_use — the only signal we
+    // get that the approval window closed.
+    const store = new Store()
+    const cancel = vi.fn()
+    const mgr = makeManager(store, { tuiFullscreen: true }, false, cancel)
+    const sessionId = 'sess-stale-approval'
+    store.dispatch({
+      type: 'jsonClaude/sessionStarted',
+      payload: { sessionId, worktreePath: '/tmp/wt' }
+    })
+    mgr.create(sessionId, '/tmp/wt')
+    sessionProcs()[0].stdout.emit(
+      'data',
+      Buffer.from(
+        JSON.stringify({
+          type: 'user',
+          message: {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'toolu_timeout',
+                is_error: true,
+                content:
+                  '<tool_use_error>Error calling tool (AskUserQuestion): MCP server "ness-permissions" tool "approve" sent no response or progress for 1800s; aborting.</tool_use_error>'
+              }
+            ]
+          }
+        }) + '\n'
+      )
+    )
+    expect(cancel).toHaveBeenCalledWith(sessionId, 'toolu_timeout')
   })
 
   it('omits --append-system-prompt, --model, --name when launch settings are unset', () => {
