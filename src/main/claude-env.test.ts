@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterAll, vi } from 'vitest'
-import { mkdtempSync, writeFileSync, chmodSync, rmSync } from 'fs'
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, existsSync } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
 
@@ -161,5 +161,51 @@ describe('resolveShellEnv caching', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('retries a failed probe on the next resolve instead of serving the failure', async () => {
+    const { resolveShellEnv, warmShellEnv } = await import('./claude-env')
+    const marker = join(tmpRoot, 'broken-until-removed')
+    writeFileSync(marker, '')
+    const shell = fakeShell(
+      'recovering-shell',
+      `if [ -e "${marker}" ]; then exit 0; fi; printf '${BEGIN}CLAUDE_CONFIG_DIR=/late\\0${END}'`
+    )
+    currentShell = shell
+    expect(await warmShellEnv(tmpRoot)).toBeNull()
+    expect(await warmShellEnv(tmpRoot)).toBeNull()
+    rmSync(marker)
+    expect(await warmShellEnv(tmpRoot)).toBeNull()
+    expect((await resolveShellEnv(tmpRoot))?.CLAUDE_CONFIG_DIR).toBe('/late')
+  })
+
+  it('runs a few probes at a time and lets a resolve overtake queued warm-ups', async () => {
+    const { resolveShellEnv, warmShellEnv } = await import('./claude-env')
+    const slots = join(tmpRoot, 'slots')
+    const violation = join(tmpRoot, 'too-many-at-once')
+    mkdirSync(slots, { recursive: true })
+    const shell = fakeShell(
+      'slow-shell',
+      [
+        `touch "${slots}/$$"`,
+        `if [ "$(ls "${slots}" | wc -l)" -gt 2 ]; then touch "${violation}"; fi`,
+        'sleep 0.3',
+        `rm -f "${slots}/$$"`,
+        `printf '${BEGIN}CWD=%s\\0${END}' "$(pwd)"`
+      ].join('\n')
+    )
+    currentShell = shell
+    const dirs = Array.from({ length: 7 }, (_, i) => join(tmpRoot, `wt${i}`))
+    for (const d of dirs) mkdirSync(d, { recursive: true })
+
+    const done: string[] = []
+    const warms = dirs.slice(0, 6).map((d) => warmShellEnv(d).then(() => done.push(d)))
+    const urgent = resolveShellEnv(dirs[6]).then(() => done.push(dirs[6]))
+    await Promise.all([...warms, urgent])
+
+    expect(existsSync(violation)).toBe(false)
+    // Two warm-ups are already running when the resolve lands, so it is
+    // the third to start; without priority it would be the last.
+    expect(done.indexOf(dirs[6])).toBeLessThanOrEqual(3)
   })
 })

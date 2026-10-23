@@ -632,7 +632,12 @@ hard dependency on `gh`.
   status, and cost. The probe is a full shell startup (~1s on a heavy
   rc file), so it must stay off the hot path: sync readers only read
   the cache, and async entry points (`startJsonClaudeSession`, the
-  `agent:*` request handlers) are the ones that await it.
+  `agent:*` request handlers) are the ones that await it. Probes run
+  two at a time through a queue — the boot warm-up covers every
+  worktree, and fifty login shells started together all blow the
+  timeout — with a spawn's `resolveShellEnv` jumping ahead of queued
+  warm-ups. A failed probe is never served as an answer: `warmShellEnv`
+  leaves it alone, `resolveShellEnv` retries it.
 
 ## Workflow conventions
 

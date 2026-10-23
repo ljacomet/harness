@@ -11,7 +11,10 @@
 // A probe costs one full login-shell startup (~1s with a heavy rc file),
 // so it never runs on the hot path: spawn paths await `resolveShellEnv`,
 // which only re-probes when the entry is older than FRESH_MS, and sync
-// readers consult the cache without side effects.
+// readers consult the cache without side effects. Probes also never run
+// all at once: the boot warm-up covers every worktree, and fifty login
+// shells starting together starve each other past any timeout, which
+// would cache a failure for the very spawn that needed the answer.
 
 import { spawn } from 'child_process'
 import { homedir } from 'os'
@@ -22,8 +25,9 @@ import { log } from './debug'
 const BEGIN = '__HARNESS_ENV_BEGIN__'
 const END = '__HARNESS_ENV_END__'
 const PROBE = `printf '${BEGIN}'; /usr/bin/env -0; printf '${END}'`
-const DEFAULT_TIMEOUT_MS = 5000
+const DEFAULT_TIMEOUT_MS = 10_000
 const FRESH_MS = 60_000
+const MAX_CONCURRENT_PROBES = 2
 
 export type ShellEnv = Record<string, string>
 
@@ -34,6 +38,8 @@ interface CacheEntry {
 
 const cache = new Map<string, CacheEntry>()
 const inflight = new Map<string, Promise<ShellEnv | null>>()
+const queue: Array<{ cwd: string; start: () => void }> = []
+let running = 0
 let explicitConfigDir: () => string | undefined = () => undefined
 
 export function parseEnvProbeOutput(stdout: string): ShellEnv | null {
@@ -115,10 +121,37 @@ export async function captureShellEnv(
   })
 }
 
-function refresh(cwd: string): Promise<ShellEnv | null> {
+function pump(): void {
+  while (running < MAX_CONCURRENT_PROBES && queue.length > 0) {
+    running++
+    queue.shift()!.start()
+  }
+}
+
+/** Queue a probe for `cwd`. `urgent` puts it ahead of queued warm-ups —
+ *  a spawn waiting on its answer should not sit behind the boot sweep. */
+function refresh(cwd: string, urgent: boolean): Promise<ShellEnv | null> {
   const pending = inflight.get(cwd)
-  if (pending) return pending
-  const probe = captureShellEnv(resolveUserShell(), cwd)
+  if (pending) {
+    if (urgent) {
+      const idx = queue.findIndex((q) => q.cwd === cwd)
+      if (idx > 0) queue.unshift(...queue.splice(idx, 1))
+    }
+    return pending
+  }
+  const probe = new Promise<ShellEnv | null>((resolve) => {
+    const start = (): void => {
+      captureShellEnv(resolveUserShell(), cwd)
+        .then(resolve)
+        .finally(() => {
+          running--
+          pump()
+        })
+    }
+    if (urgent) queue.unshift({ cwd, start })
+    else queue.push({ cwd, start })
+    pump()
+  })
     .then((env) => {
       // A failed probe must not erase a good earlier capture — a transient
       // timeout would otherwise flip the worktree back to the default home.
@@ -138,19 +171,21 @@ function refresh(cwd: string): Promise<ShellEnv | null> {
 
 /** The login-shell environment for `cwd`, re-probed when the cached copy
  *  is older than FRESH_MS so env changes made while Ness runs are picked
- *  up by the next spawn. Null when the probe failed and nothing better is
- *  cached. */
+ *  up by the next spawn. A cached failure is never an answer: it is
+ *  retried on every call. Null when the probe failed and nothing better
+ *  is cached. */
 export function resolveShellEnv(cwd: string): Promise<ShellEnv | null> {
   const hit = cache.get(cwd)
-  if (hit && Date.now() - hit.capturedAt < FRESH_MS) return Promise.resolve(hit.env)
-  return refresh(cwd)
+  if (hit?.env && Date.now() - hit.capturedAt < FRESH_MS) return Promise.resolve(hit.env)
+  return refresh(cwd, true)
 }
 
-/** Probe `cwd` only if nothing is cached for it yet. */
+/** Probe `cwd` only if it has never been probed. Background use only;
+ *  a spawn that needs the answer goes through `resolveShellEnv`. */
 export function warmShellEnv(cwd: string): Promise<ShellEnv | null> {
   const hit = cache.get(cwd)
   if (hit) return Promise.resolve(hit.env)
-  return refresh(cwd)
+  return refresh(cwd, false)
 }
 
 /** Last capture for `cwd` or its nearest cached ancestor (tabs can run in
@@ -206,5 +241,7 @@ export function knownClaudeConfigDirs(): string[] {
 export function resetClaudeEnvCacheForTests(): void {
   cache.clear()
   inflight.clear()
+  queue.length = 0
+  running = 0
   explicitConfigDir = () => undefined
 }
